@@ -11,6 +11,18 @@ package csdk
 // #include "../../../bcos-c-sdk/bcos_sdk_c_error.h"
 // #include "../../../bcos-c-sdk/bcos_sdk_c_rpc.h"
 // #include "../../../bcos-c-sdk/bcos_sdk_c_uti_tx.h"
+// void* bcos_sdk_create_transaction_v1_data(
+//   const char* group_id,
+//   const char* chain_id,
+//   const char* to,
+//   const char* nonce,
+//   const unsigned char* input,
+//   long inputSize,
+//   const char* abi,
+//   int64_t block_limit,
+//   const char* value,
+//   const char* gas_price,
+//   int64_t gas_limit);
 // #include "../../../bcos-c-sdk/bcos_sdk_c_amop.h"
 // #include "../../../bcos-c-sdk/bcos_sdk_c_event_sub.h"
 // #include "../../../bcos-c-sdk/bcos_sdk_c_uti_keypair.h"
@@ -620,6 +632,76 @@ func (csdk *CSDK) CreateEncodedTransactionDataV1(blockLimit int64, to string, in
 	if C.bcos_sdk_is_last_opr_success() == 0 {
 		return nil, nil, fmt.Errorf("bcos_sdk_create_transaction_data hash error: %s", C.GoString(C.bcos_sdk_get_last_error_msg()))
 	}
+	return data, dataHash, nil
+}
+
+// CreateEncodedTransactionDataV1WithNonceV1Data uses bcos_sdk_create_transaction_v1_data to build
+// encoded transaction data with explicit nonce.
+func (csdk *CSDK) CreateEncodedTransactionDataV1WithNonceV1Data(blockLimit int64, to string, input []byte, abi string, nonce string, value string, gasPrice string) ([]byte, []byte, error) {
+	cTo := C.CString(to)
+	cNonce := C.CString(nonce)
+	cAbi := C.CString(abi)
+	defer C.free(unsafe.Pointer(cTo))
+	defer C.free(unsafe.Pointer(cNonce))
+	defer C.free(unsafe.Pointer(cAbi))
+
+	var inputPtr unsafe.Pointer
+	if len(input) > 0 {
+		inputPtr = unsafe.Pointer(&input[0])
+	} else {
+		// Avoid passing non-nil pointer for empty input; createTransactionDataV1 expects input bytes.
+		inputPtr = unsafe.Pointer(&[]byte{0}[0])
+	}
+
+	cValue := C.CString(value)
+	cGasPrice := C.CString(gasPrice)
+	defer C.free(unsafe.Pointer(cValue))
+	defer C.free(unsafe.Pointer(cGasPrice))
+
+	encodedTransactionPointer := C.bcos_sdk_create_transaction_v1_data(
+		csdk.groupID,
+		csdk.chainID,
+		cTo,
+		cNonce,
+		(*C.uchar)(inputPtr),
+		C.long(len(input)),
+		cAbi,
+		C.int64_t(blockLimit),
+		cValue,
+		cGasPrice,
+		C.int64_t(0), // gas_limit >= 0; 0 acts as placeholder for builder.
+	)
+	defer C.bcos_sdk_destroy_transaction_data(encodedTransactionPointer)
+
+	if C.bcos_sdk_is_last_opr_success() == 0 {
+		return nil, nil, fmt.Errorf("bcos_sdk_create_transaction_v1_data error: %s", C.GoString(C.bcos_sdk_get_last_error_msg()))
+	}
+
+	encodedTransactionData := C.bcos_sdk_encode_transaction_data(encodedTransactionPointer)
+	defer C.bcos_sdk_c_free(unsafe.Pointer(encodedTransactionData))
+	if C.bcos_sdk_is_last_opr_success() == 0 {
+		return nil, nil, fmt.Errorf("bcos_sdk_create_transaction_v1_data encode error: %s", C.GoString(C.bcos_sdk_get_last_error_msg()))
+	}
+
+	data, err := hex.DecodeString(strings.TrimPrefix(C.GoString(encodedTransactionData), "0x"))
+	if err != nil {
+		return nil, nil, err
+	}
+
+	cryptoType := C.int(0)
+	if csdk.smCrypto {
+		cryptoType = C.int(1)
+	}
+	dataHashHex := C.bcos_sdk_calc_transaction_data_hash(cryptoType, encodedTransactionPointer)
+	defer C.bcos_sdk_c_free(unsafe.Pointer(dataHashHex))
+	if C.bcos_sdk_is_last_opr_success() == 0 {
+		return nil, nil, fmt.Errorf("bcos_sdk_calc_transaction_data_hash error: %s", C.GoString(C.bcos_sdk_get_last_error_msg()))
+	}
+	dataHash, err := hex.DecodeString(strings.TrimPrefix(C.GoString(dataHashHex), "0x"))
+	if err != nil {
+		return nil, nil, err
+	}
+
 	return data, dataHash, nil
 }
 
