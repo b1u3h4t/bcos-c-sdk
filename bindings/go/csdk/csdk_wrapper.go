@@ -11,6 +11,10 @@ package csdk
 // #include "../../../bcos-c-sdk/bcos_sdk_c_error.h"
 // #include "../../../bcos-c-sdk/bcos_sdk_c_rpc.h"
 // #include "../../../bcos-c-sdk/bcos_sdk_c_uti_tx.h"
+// void bcos_sdk_create_signed_transaction_with_full_fields(void* key_pair, const char* group_id,
+//     const char* chain_id, const char* to, const char* nonce, const unsigned char* input,
+//     long inputSize, const char* abi, int64_t block_limit, const char* value, const char* gas_price,
+//     int64_t gas_limit, int32_t attribute, const char* extra_data, char** tx_hash, char** signed_tx);
 // void* bcos_sdk_create_transaction_v1_data(
 //   const char* group_id,
 //   const char* chain_id,
@@ -593,6 +597,137 @@ func (csdk *CSDK) CreateAndSendTransaction(chanData *CallbackChan, to string, da
 		return txHash, fmt.Errorf("bcos rpc send transaction failed, error: %s", C.GoString(C.bcos_sdk_get_last_error_msg()))
 	}
 	return txHash, nil
+}
+
+// SignedTxPair is the result of bcos_sdk_create_signed_transaction_with_full_fields.
+type SignedTxPair struct {
+	TxHash   string
+	SignedTx []byte
+}
+
+// NewKeyPairFromPrivateKey creates an ephemeral SM2/secp256k1 keypair (caller must DestroyKeyPair).
+func (csdk *CSDK) NewKeyPairFromPrivateKey(privateKey []byte) (unsafe.Pointer, error) {
+	if len(privateKey) != 32 {
+		return nil, fmt.Errorf("private key must be 32 bytes, got %d", len(privateKey))
+	}
+	cryptoType := C_SDK_ECDSA_CRYPTO
+	if csdk.smCrypto {
+		cryptoType = C_SDK_SM_CRYPTO
+	}
+	keyPair := C.bcos_sdk_create_keypair_by_private_key(cryptoType, unsafe.Pointer(&privateKey[0]), C.uint(len(privateKey)))
+	if keyPair == nil {
+		return nil, fmt.Errorf("bcos_sdk_create_keypair_by_private_key: %s", C.GoString(C.bcos_sdk_get_last_error_msg()))
+	}
+	return keyPair, nil
+}
+
+// DestroyKeyPair releases a keypair created by NewKeyPairFromPrivateKey.
+func (csdk *CSDK) DestroyKeyPair(keyPair unsafe.Pointer) {
+	if keyPair != nil {
+		C.bcos_sdk_destroy_keypair(keyPair)
+	}
+}
+
+// CreateSignedTransactionWithDefaultKeyPair signs using the connection's default keypair.
+func (csdk *CSDK) CreateSignedTransactionWithDefaultKeyPair(
+	blockLimit int64,
+	to string,
+	nonce string,
+	input []byte,
+	abi string,
+	attribute int32,
+	extraData string,
+) (*SignedTxPair, error) {
+	csdk.keyPairMutex.Lock()
+	defer csdk.keyPairMutex.Unlock()
+	return csdk.createSignedTransactionWithFullFields(csdk.keyPair, blockLimit, to, nonce, input, abi, attribute, "", "", 0, extraData)
+}
+
+// CreateSignedTransactionWithPrivateKey signs with an explicit 32-byte private key (ephemeral keypair).
+func (csdk *CSDK) CreateSignedTransactionWithPrivateKey(
+	privateKey []byte,
+	blockLimit int64,
+	to string,
+	nonce string,
+	input []byte,
+	abi string,
+	attribute int32,
+	extraData string,
+) (*SignedTxPair, error) {
+	keyPair, err := csdk.NewKeyPairFromPrivateKey(privateKey)
+	if err != nil {
+		return nil, err
+	}
+	defer csdk.DestroyKeyPair(keyPair)
+	return csdk.createSignedTransactionWithFullFields(keyPair, blockLimit, to, nonce, input, abi, attribute, "", "", 0, extraData)
+}
+
+func (csdk *CSDK) createSignedTransactionWithFullFields(
+	keyPair unsafe.Pointer,
+	blockLimit int64,
+	to string,
+	nonce string,
+	input []byte,
+	abi string,
+	attribute int32,
+	value string,
+	gasPrice string,
+	gasLimit int64,
+	extraData string,
+) (*SignedTxPair, error) {
+	if keyPair == nil {
+		return nil, fmt.Errorf("key pair is nil")
+	}
+	if len(input) == 0 {
+		return nil, fmt.Errorf("input is empty")
+	}
+	cTo := C.CString(to)
+	cNonce := C.CString(nonce)
+	cAbi := C.CString(abi)
+	cValue := C.CString(value)
+	cGasPrice := C.CString(gasPrice)
+	cExtra := C.CString(extraData)
+	defer C.free(unsafe.Pointer(cTo))
+	defer C.free(unsafe.Pointer(cNonce))
+	defer C.free(unsafe.Pointer(cAbi))
+	defer C.free(unsafe.Pointer(cValue))
+	defer C.free(unsafe.Pointer(cGasPrice))
+	defer C.free(unsafe.Pointer(cExtra))
+
+	var txHash *C.char
+	var signedTx *C.char
+	C.bcos_sdk_create_signed_transaction_with_full_fields(
+		keyPair,
+		csdk.groupID,
+		csdk.chainID,
+		cTo,
+		cNonce,
+		(*C.uchar)(unsafe.Pointer(&input[0])),
+		C.long(len(input)),
+		cAbi,
+		C.int64_t(blockLimit),
+		cValue,
+		cGasPrice,
+		C.int64_t(gasLimit),
+		C.int32_t(attribute),
+		cExtra,
+		&txHash,
+		&signedTx,
+	)
+	if C.bcos_sdk_is_last_opr_success() == 0 {
+		return nil, fmt.Errorf("bcos_sdk_create_signed_transaction_with_full_fields: %s", C.GoString(C.bcos_sdk_get_last_error_msg()))
+	}
+	defer C.bcos_sdk_c_free(unsafe.Pointer(txHash))
+	defer C.bcos_sdk_c_free(unsafe.Pointer(signedTx))
+
+	encoded, err := hex.DecodeString(strings.TrimPrefix(C.GoString(signedTx), "0x"))
+	if err != nil {
+		return nil, fmt.Errorf("decode signed tx: %w", err)
+	}
+	return &SignedTxPair{
+		TxHash:   C.GoString(txHash),
+		SignedTx: encoded,
+	}, nil
 }
 
 func (csdk *CSDK) CreateEncodedTransactionDataV1(blockLimit int64, to string, input []byte, abi string) ([]byte, []byte, error) {
