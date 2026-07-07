@@ -166,57 +166,73 @@ func getContext(index unsafe.Pointer, delete bool) *CallbackChan {
 	return nil
 }
 
-func NewSDK(groupID string, host string, port int, isSmSsl bool, privateKey []byte, disableSsl bool, tlsCaPath, tlsKeyPath, tlsCertPath, tlsSmEnKey, tlsSEnCert string) (*CSDK, error) {
-	cHost := C.CString(host)
-	defer C.free(unsafe.Pointer(cHost)) // Fix memory leak: free C string allocated by C.CString
-	cPort := C.int(port)
-	cIsSmSsl := C.int(0)
-	if isSmSsl {
-		cIsSmSsl = C.int(1)
-	}
-	config := C.bcos_sdk_create_config(cIsSmSsl, cHost, cPort)
-	defer C.bcos_sdk_c_config_destroy(unsafe.Pointer(config))
+// Endpoint is a BCOS RPC peer (host + port).
+type Endpoint struct {
+	Host string
+	Port int
+}
 
+// SdkOptions configures [common] for programmatic connections (INI-equivalent defaults when nil).
+type SdkOptions struct {
+	ThreadPoolSize                   *int
+	MessageTimeoutMs                 *int
+	SendRpcRequestToHighestBlockNode *bool
+}
+
+func intDefault(p *int, fallback int) int {
+	if p != nil {
+		return *p
+	}
+	return fallback
+}
+
+func boolDefault(p *bool, fallback bool) bool {
+	if p != nil {
+		return *p
+	}
+	return fallback
+}
+
+func applyTlsToConfig(config *C.struct_bcos_sdk_c_config, isSmSsl, disableSsl bool, tlsCaPath, tlsKeyPath, tlsCertPath, tlsSmEnKey, tlsSEnCert string) {
+	if disableSsl {
+		config.disable_ssl = C.int(1)
+		return
+	}
 	cTlsCaPath := C.CString(tlsCaPath)
 	cTlsKeyPath := C.CString(tlsKeyPath)
 	cTlsCertPath := C.CString(tlsCertPath)
-	if !disableSsl {
-		if isSmSsl {
-			C.bcos_sdk_c_free(unsafe.Pointer(config.sm_cert_config.ca_cert))
-			config.sm_cert_config.ca_cert = cTlsCaPath
-			C.bcos_sdk_c_free(unsafe.Pointer(config.sm_cert_config.node_key))
-			config.sm_cert_config.node_key = cTlsKeyPath
-			C.bcos_sdk_c_free(unsafe.Pointer(config.sm_cert_config.node_cert))
-			config.sm_cert_config.node_cert = cTlsCertPath
-
-			C.bcos_sdk_c_free(unsafe.Pointer(config.sm_cert_config.en_node_key))
-			cTlsSmEnKey := C.CString(tlsSmEnKey)
-			config.sm_cert_config.en_node_key = cTlsSmEnKey
-			C.bcos_sdk_c_free(unsafe.Pointer(config.sm_cert_config.en_node_cert))
-			cTlsSmEnCert := C.CString(tlsSEnCert)
-			config.sm_cert_config.en_node_cert = cTlsSmEnCert
-		} else {
-			C.bcos_sdk_c_free(unsafe.Pointer(config.cert_config.ca_cert))
-			config.cert_config.ca_cert = cTlsCaPath
-			C.bcos_sdk_c_free(unsafe.Pointer(config.cert_config.node_key))
-			config.cert_config.node_key = cTlsKeyPath
-			C.bcos_sdk_c_free(unsafe.Pointer(config.cert_config.node_cert))
-			config.cert_config.node_cert = cTlsCertPath
-		}
+	if isSmSsl {
+		C.bcos_sdk_c_free(unsafe.Pointer(config.sm_cert_config.ca_cert))
+		config.sm_cert_config.ca_cert = cTlsCaPath
+		C.bcos_sdk_c_free(unsafe.Pointer(config.sm_cert_config.node_key))
+		config.sm_cert_config.node_key = cTlsKeyPath
+		C.bcos_sdk_c_free(unsafe.Pointer(config.sm_cert_config.node_cert))
+		config.sm_cert_config.node_cert = cTlsCertPath
+		C.bcos_sdk_c_free(unsafe.Pointer(config.sm_cert_config.en_node_key))
+		cTlsSmEnKey := C.CString(tlsSmEnKey)
+		config.sm_cert_config.en_node_key = cTlsSmEnKey
+		C.bcos_sdk_c_free(unsafe.Pointer(config.sm_cert_config.en_node_cert))
+		cTlsSmEnCert := C.CString(tlsSEnCert)
+		config.sm_cert_config.en_node_cert = cTlsSmEnCert
 	} else {
-		config.disable_ssl = C.int(1)
+		C.bcos_sdk_c_free(unsafe.Pointer(config.cert_config.ca_cert))
+		config.cert_config.ca_cert = cTlsCaPath
+		C.bcos_sdk_c_free(unsafe.Pointer(config.cert_config.node_key))
+		config.cert_config.node_key = cTlsKeyPath
+		C.bcos_sdk_c_free(unsafe.Pointer(config.cert_config.node_cert))
+		config.cert_config.node_cert = cTlsCertPath
 	}
-	config.message_timeout_ms = C.int(-1)
+}
+
+func startSDKFromConfig(groupID string, privateKey []byte, config *C.struct_bcos_sdk_c_config) (*CSDK, error) {
 	sdk := C.bcos_sdk_create(config)
 	if sdk == nil {
 		message := C.bcos_sdk_get_last_error_msg()
-		//defer C.free(unsafe.Pointer(message))
 		return nil, fmt.Errorf("bcos_sdk_create failed with error: %s", C.GoString(message))
 	}
 	C.bcos_sdk_start(sdk)
 	if C.bcos_sdk_get_last_error() != 0 {
 		message := C.bcos_sdk_get_last_error_msg()
-		//defer C.free(unsafe.Pointer(message))
 		return nil, fmt.Errorf("bcos_sdk_start failed with error: %s", C.GoString(message))
 	}
 
@@ -239,6 +255,95 @@ func NewSDK(groupID string, host string, port int, isSmSsl bool, privateKey []by
 		privateKeyBytes: privateKey,
 		keyPair:         keyPair,
 	}, nil
+}
+
+// NewSDKWithPeers connects to multiple RPC peers with TLS settings and optional [common] overrides.
+func NewSDKWithPeers(groupID string, peers []Endpoint, isSmSsl bool, privateKey []byte, disableSsl bool, tlsCaPath, tlsKeyPath, tlsCertPath, tlsSmEnKey, tlsSEnCert string, opts *SdkOptions) (*CSDK, error) {
+	if len(peers) == 0 {
+		return nil, fmt.Errorf("peers must not be empty")
+	}
+	for i, p := range peers {
+		if p.Host == "" || p.Port <= 0 || p.Port > 65535 {
+			return nil, fmt.Errorf("invalid peer at index %d: %s:%d", i, p.Host, p.Port)
+		}
+	}
+
+	cIsSmSsl := C.int(0)
+	if isSmSsl {
+		cIsSmSsl = C.int(1)
+	}
+	firstHost := C.CString(peers[0].Host)
+	defer C.free(unsafe.Pointer(firstHost))
+	config := C.bcos_sdk_create_config(cIsSmSsl, firstHost, C.int(peers[0].Port))
+	if config == nil {
+		return nil, fmt.Errorf("bcos_sdk_create_config failed")
+	}
+	defer C.bcos_sdk_c_config_destroy(unsafe.Pointer(config))
+
+	if len(peers) > 1 {
+		epBase := (*C.struct_bcos_sdk_c_endpoint)(C.malloc(C.size_t(len(peers)) * C.size_t(unsafe.Sizeof(C.struct_bcos_sdk_c_endpoint{}))))
+		for i, p := range peers {
+			ep := (*C.struct_bcos_sdk_c_endpoint)(unsafe.Add(unsafe.Pointer(epBase), uintptr(i)*unsafe.Sizeof(C.struct_bcos_sdk_c_endpoint{})))
+			ep.host = C.CString(p.Host)
+			ep.port = C.uint16_t(p.Port)
+		}
+		if config.peers_count > 0 && config.peers != nil {
+			first := (*C.struct_bcos_sdk_c_endpoint)(unsafe.Pointer(config.peers))
+			C.bcos_sdk_c_free(unsafe.Pointer(first.host))
+			C.bcos_sdk_c_free(unsafe.Pointer(config.peers))
+		}
+		config.peers = epBase
+		config.peers_count = C.size_t(len(peers))
+	}
+
+	config.thread_pool_size = C.int(intDefault(optsThreadPool(opts), 8))
+	config.message_timeout_ms = C.int(intDefault(optsMessageTimeout(opts), 10000))
+	sendHighest := boolDefault(optsSendToHighest(opts), true)
+	if sendHighest {
+		config.send_rpc_request_to_highest_block_node = C.int(1)
+	} else {
+		config.send_rpc_request_to_highest_block_node = C.int(0)
+	}
+
+	applyTlsToConfig(config, isSmSsl, disableSsl, tlsCaPath, tlsKeyPath, tlsCertPath, tlsSmEnKey, tlsSEnCert)
+	return startSDKFromConfig(groupID, privateKey, config)
+}
+
+func optsThreadPool(opts *SdkOptions) *int {
+	if opts == nil {
+		return nil
+	}
+	return opts.ThreadPoolSize
+}
+
+func optsMessageTimeout(opts *SdkOptions) *int {
+	if opts == nil {
+		return nil
+	}
+	return opts.MessageTimeoutMs
+}
+
+func optsSendToHighest(opts *SdkOptions) *bool {
+	if opts == nil {
+		return nil
+	}
+	return opts.SendRpcRequestToHighestBlockNode
+}
+
+func NewSDK(groupID string, host string, port int, isSmSsl bool, privateKey []byte, disableSsl bool, tlsCaPath, tlsKeyPath, tlsCertPath, tlsSmEnKey, tlsSEnCert string) (*CSDK, error) {
+	cHost := C.CString(host)
+	defer C.free(unsafe.Pointer(cHost)) // Fix memory leak: free C string allocated by C.CString
+	cPort := C.int(port)
+	cIsSmSsl := C.int(0)
+	if isSmSsl {
+		cIsSmSsl = C.int(1)
+	}
+	config := C.bcos_sdk_create_config(cIsSmSsl, cHost, cPort)
+	defer C.bcos_sdk_c_config_destroy(unsafe.Pointer(config))
+
+	applyTlsToConfig(config, isSmSsl, disableSsl, tlsCaPath, tlsKeyPath, tlsCertPath, tlsSmEnKey, tlsSEnCert)
+	config.message_timeout_ms = C.int(-1)
+	return startSDKFromConfig(groupID, privateKey, config)
 }
 
 func NewSDKByConfigFile(configFile string, groupID string, privateKey []byte) (*CSDK, error) {
