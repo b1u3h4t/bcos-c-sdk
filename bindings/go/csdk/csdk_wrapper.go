@@ -6,6 +6,8 @@ package csdk
 // #cgo linux,arm64 LDFLAGS: -L/usr/local/lib/ -L${SRCDIR}/libs -lbcos-c-sdk-aarch64
 // #cgo windows,amd64 LDFLAGS: -L${SRCDIR}/libs -L${SRCDIR}/libs/win -lbcos-c-sdk
 // #cgo CFLAGS: -I./
+// #include <stdlib.h>
+// #include <stdbool.h>
 // #include "../../../bcos-c-sdk/bcos_sdk_c_common.h"
 // #include "../../../bcos-c-sdk/bcos_sdk_c.h"
 // #include "../../../bcos-c-sdk/bcos_sdk_c_error.h"
@@ -56,7 +58,9 @@ type CSDK struct {
 	groupID         *C.char
 	keyPair         unsafe.Pointer
 	privateKeyBytes []byte
-	keyPairMutex    sync.Mutex
+	// keyPairMutex guards keyPair pointer lifetime.
+	// Sign/read paths take RLock; SetPrivateKey/Close take Lock so they exclude concurrent signs.
+	keyPairMutex sync.RWMutex
 }
 
 var contextCache = cache.New(5*time.Minute, 10*time.Minute)
@@ -683,13 +687,13 @@ func (csdk *CSDK) CreateAndSendTransaction(chanData *CallbackChan, to string, da
 	if block_limit < 0 {
 		return nil, fmt.Errorf("group not exist, group: %s", C.GoString(csdk.groupID))
 	}
-	csdk.keyPairMutex.Lock()
+	csdk.keyPairMutex.RLock()
 	C.bcos_sdk_create_signed_transaction_ver_extra_data(csdk.keyPair, csdk.groupID, csdk.chainID, cTo, cData, cAbi, block_limit, 0, cExtraData, &tx_hash, &signed_tx)
 	if C.bcos_sdk_is_last_opr_success() == 0 {
-		csdk.keyPairMutex.Unlock()
+		csdk.keyPairMutex.RUnlock()
 		return nil, fmt.Errorf("bcos_sdk_create_signed_transaction, error: %s", C.GoString(C.bcos_sdk_get_last_error_msg()))
 	}
-	csdk.keyPairMutex.Unlock()
+	csdk.keyPairMutex.RUnlock()
 	defer C.bcos_sdk_c_free(unsafe.Pointer(tx_hash))
 	defer C.bcos_sdk_c_free(unsafe.Pointer(signed_tx))
 	txHash, err := hex.DecodeString(strings.TrimPrefix(C.GoString(tx_hash), "0x"))
@@ -743,8 +747,8 @@ func (csdk *CSDK) CreateSignedTransactionWithDefaultKeyPair(
 	attribute int32,
 	extraData string,
 ) (*SignedTxPair, error) {
-	csdk.keyPairMutex.Lock()
-	defer csdk.keyPairMutex.Unlock()
+	csdk.keyPairMutex.RLock()
+	defer csdk.keyPairMutex.RUnlock()
 	return csdk.createSignedTransactionWithFullFields(csdk.keyPair, blockLimit, to, nonce, input, abi, attribute, "", "", 0, extraData)
 }
 
@@ -948,8 +952,9 @@ func (csdk *CSDK) CreateEncodedTransactionDataV1WithNonceV1Data(blockLimit int64
 func (csdk *CSDK) CreateEncodedSignature(hash []byte) ([]byte, error) {
 	hexHash := hex.EncodeToString(hash)
 	cHexHash := C.CString(hexHash)
-	csdk.keyPairMutex.Lock()
-	defer csdk.keyPairMutex.Unlock()
+	defer C.free(unsafe.Pointer(cHexHash))
+	csdk.keyPairMutex.RLock()
+	defer csdk.keyPairMutex.RUnlock()
 	signatureHex := C.bcos_sdk_sign_transaction_data_hash(csdk.keyPair, cHexHash)
 	defer C.bcos_sdk_c_free(unsafe.Pointer(signatureHex))
 	if C.bcos_sdk_is_last_opr_success() == 0 {
@@ -960,6 +965,34 @@ func (csdk *CSDK) CreateEncodedSignature(hash []byte) ([]byte, error) {
 		return nil, err
 	}
 	return signatureBytes, nil
+}
+
+// KeyPairAddress returns the address of the current default keypair.
+func (csdk *CSDK) KeyPairAddress() (string, error) {
+	csdk.keyPairMutex.RLock()
+	defer csdk.keyPairMutex.RUnlock()
+	if csdk.keyPair == nil {
+		return "", fmt.Errorf("key pair is nil")
+	}
+	addr := C.bcos_sdk_get_keypair_address(csdk.keyPair)
+	if addr == nil {
+		return "", fmt.Errorf("bcos_sdk_get_keypair_address failed: %s", C.GoString(C.bcos_sdk_get_last_error_msg()))
+	}
+	return C.GoString(addr), nil
+}
+
+// KeyPairPublicKey returns the hex public key of the current default keypair (no 0x prefix).
+func (csdk *CSDK) KeyPairPublicKey() (string, error) {
+	csdk.keyPairMutex.RLock()
+	defer csdk.keyPairMutex.RUnlock()
+	if csdk.keyPair == nil {
+		return "", fmt.Errorf("key pair is nil")
+	}
+	pk := C.bcos_sdk_get_keypair_public_key(csdk.keyPair)
+	if pk == nil {
+		return "", fmt.Errorf("bcos_sdk_get_keypair_public_key failed: %s", C.GoString(C.bcos_sdk_get_last_error_msg()))
+	}
+	return strings.TrimPrefix(C.GoString(pk), "0x"), nil
 }
 
 func (csdk *CSDK) CreateEncodedTransaction(transactionData, dataHash, signature []byte, attribute int32, extraData string) ([]byte, error) {
@@ -1002,3 +1035,48 @@ func (csdk *CSDK) SendEncodedTransaction(chanData *CallbackChan, encodedTransact
 	}
 	return nil
 }
+
+// NewSignOnlyCSDK builds a CSDK that can sign/verify without a live RPC connection.
+// Use CloseSignOnly to free resources (not Close, which expects a network SDK).
+func NewSignOnlyCSDK(smCrypto bool, privateKey []byte, groupID, chainID string) (*CSDK, error) {
+	if len(privateKey) != 32 {
+		return nil, fmt.Errorf("private key must be 32 bytes")
+	}
+	cryptoType := C_SDK_ECDSA_CRYPTO
+	if smCrypto {
+		cryptoType = C_SDK_SM_CRYPTO
+	}
+	keyPair := C.bcos_sdk_create_keypair_by_private_key(cryptoType, unsafe.Pointer(&privateKey[0]), C.uint(len(privateKey)))
+	if keyPair == nil {
+		return nil, fmt.Errorf("bcos_sdk_create_keypair_by_private_key: %s", C.GoString(C.bcos_sdk_get_last_error_msg()))
+	}
+	return &CSDK{
+		smCrypto:        smCrypto,
+		groupID:         C.CString(groupID),
+		chainID:         C.CString(chainID),
+		keyPair:         keyPair,
+		privateKeyBytes: append([]byte(nil), privateKey...),
+	}, nil
+}
+
+// CloseSignOnly releases keypair/strings created by NewSignOnlyCSDK.
+func (csdk *CSDK) CloseSignOnly() {
+	if csdk == nil {
+		return
+	}
+	csdk.keyPairMutex.Lock()
+	defer csdk.keyPairMutex.Unlock()
+	if csdk.keyPair != nil {
+		C.bcos_sdk_destroy_keypair(csdk.keyPair)
+		csdk.keyPair = nil
+	}
+	if csdk.groupID != nil {
+		C.free(unsafe.Pointer(csdk.groupID))
+		csdk.groupID = nil
+	}
+	if csdk.chainID != nil {
+		C.free(unsafe.Pointer(csdk.chainID))
+		csdk.chainID = nil
+	}
+}
+
